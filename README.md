@@ -11,7 +11,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Version-1.0-blue.svg" />
-  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20Debian-orange.svg" />
+  <img src="https://img.shields.io/badge/Platform-Kali%20Linux%20%7C%20Debian-orange.svg" />
   <img src="https://img.shields.io/badge/License-MIT-green.svg" />
 </p>
 
@@ -19,7 +19,7 @@
 
 # 🌟 Overview
 
-**Alin Vault** is a lightweight desktop productivity dashboard built with **Python and Qt**.
+**Alin Vault** is a lightweight desktop productivity dashboard built with **Python**.
 
 The application combines several daily tools into one interface similar in concept to utilities such as **Huawei PC Manager**, but tailored for **Linux users and developers**.
 
