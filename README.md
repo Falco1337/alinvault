@@ -97,4 +97,5 @@ Install using terminal:
 
 ```bash
 sudo apt update
+sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine
 sudo apt install ./alinvault.deb
