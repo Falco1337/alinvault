@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-1.0.0-blue.svg" />
+  <img src="https://img.shields.io/badge/Version-1.0-blue.svg" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20Debian-orange.svg" />
   <img src="https://img.shields.io/badge/License-MIT-green.svg" />
 </p>
@@ -76,10 +76,11 @@ Custom Chromium flags for improved performance and compatibility on Linux system
 
 Download the latest package from the **Releases** page:
 
-https://github.com/YOUR_USERNAME/YOUR_REPO/releases
+[https://github.com/Falco1337/alinvault.git]
 
 Install via terminal:
 
 ```bash
 sudo apt update
+sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine
 sudo apt install ./alinvault.deb
