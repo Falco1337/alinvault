@@ -20,9 +20,9 @@
 # 👨‍💻 Developer
 
 <p align="center">
-
-**Code by**  
-`aydiel@FalconEye`
+<strong>Code by</strong><br>
+<code>aydiel@FalconEye</code>
+</p>
 
 <p align="center">
 <a href="https://instagram.com/a.xydiel">
@@ -87,16 +87,14 @@ Custom Chromium flags for improved performance and compatibility on Linux system
 
 # 📥 Installation
 
-## Debian / Ubuntu (.deb)
+## Method 1 — Install via `.deb` (Recommended)
 
-Download the latest package from the **Releases** page:
+Download the latest package from **Releases**:
 
-> https://github.com/Falco1337/alinvault.git
+https://github.com/Falco1337/alinvault/releases
 
-Install via terminal:
+Install using terminal:
 
 ```bash
 sudo apt update
-git clone https://github.com/Falco1337/alinvault.git
-sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine
 sudo apt install ./alinvault.deb
