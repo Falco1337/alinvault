@@ -17,6 +17,21 @@
 
 ---
 
+# 👨‍💻 Developer
+
+<p align="center">
+
+**Code by**  
+`aydiel@FalconEye`
+
+<p align="center">
+<a href="https://instagram.com/a.xydiel">
+<img src="https://img.shields.io/badge/Instagram-@a.xydiel-E4405F?style=for-the-badge&logo=instagram&logoColor=white">
+</a>
+</p>
+
+---
+
 # 🌟 Overview
 
 **Alin Vault** is a lightweight desktop productivity dashboard built with **Python**.
