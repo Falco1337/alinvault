@@ -76,11 +76,12 @@ Custom Chromium flags for improved performance and compatibility on Linux system
 
 Download the latest package from the **Releases** page:
 
-[https://github.com/Falco1337/alinvault.git]
+> https://github.com/Falco1337/alinvault.git
 
 Install via terminal:
 
 ```bash
 sudo apt update
+git clone https://github.com/Falco1337/alinvault.git
 sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine
 sudo apt install ./alinvault.deb
