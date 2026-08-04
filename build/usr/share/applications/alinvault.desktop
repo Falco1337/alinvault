@@ -1,8 +1,0 @@
-[Desktop Entry]
-Name=Alin Vault
-Comment=Alin Vault
-Exec=/usr/bin/alinvault
-Icon=/opt/alinvault/assets/vault.png
-Terminal=false
-Type=Application
-Categories=Utility;
