@@ -1,17 +1,17 @@
 <p align="center">
-  <img src="assets/vault.png" alt="Alin Vault Logo" width="120">
+  <img src="wolf.png" alt="Alin Vault Logo" width="120">
 </p>
 
 <h1 align="center">Alin Vault</h1>
 
 <p align="center">
   <strong>An all-in-one productivity dashboard and system widget built with Python.</strong><br>
-  Inspired by system management tools like Huawei PC Manager, optimized for Linux environments.
+  Inspired by system management tools like Windows OS, optimized for Linux environments.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-1.0-blue.svg" />
-  <img src="https://img.shields.io/badge/Platform-Kali%20Linux%20%7C%20Debian-orange.svg" />
+  <img src="https://img.shields.io/badge/Version-3.0-blue.svg" />
+  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20Kali%20Linux%20%7C%20Debian-orange.svg" />
   <img src="https://img.shields.io/badge/License-MIT-green.svg" />
 </p>
 
