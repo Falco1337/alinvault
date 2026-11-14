@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QSplitter, QComboBox, QDialog, QDialogButtonBox,
     QFormLayout, QProgressBar, QTextBrowser, QFrame, QToolButton,
     QStyle, QSizePolicy, QSpacerItem, QGridLayout, QScrollArea,
-    QInputDialog, QCheckBox
+    QInputDialog, QCheckBox, QAbstractItemView, QListView
 )
 import sys
 import os
@@ -26,6 +26,9 @@ import json
 import shutil
 import base64
 import hashlib
+import cProfile
+import pstats
+import io
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Any
@@ -33,19 +36,14 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-sys.argv.extend(
-    [
-        "--unlimited-storage",
-        "--enable-aggressive-dom-storage-flushing",
-        "--disable-features=IsolateOrigins,site-per-process",
-    ]
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+    "--disable-blink-features=AutomationControlled "
+    "--enable-gpu-rasterization "
+    "--enable-zero-copy"
 )
 
-os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
-os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --disable-software-rasterizer --disable-blink-features=AutomationControlled"
-
 APP_NAME = "Alinvault"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.2.0"
 CONFIG_DIR = Path.home() / ".alinvault"
 CACHE_DIR = CONFIG_DIR / "web_cache"
 STORAGE_DIR = CONFIG_DIR / "web_storage"
@@ -70,10 +68,20 @@ DEFAULT_TABS = [
 ]
 
 _GLOBAL_PROFILE = None
+_GLOBAL_DOWNLOAD_HANDLER = None
+_PROFILE_DOWNLOAD_CONNECTED = False
+
+
+def _handle_profile_download(download):
+    global _GLOBAL_DOWNLOAD_HANDLER
+    if _GLOBAL_DOWNLOAD_HANDLER is None:
+        _GLOBAL_DOWNLOAD_HANDLER = DownloadHandler()
+    parent = QApplication.activeWindow()
+    _GLOBAL_DOWNLOAD_HANDLER.handle_download(download, parent)
 
 
 def get_global_profile():
-    global _GLOBAL_PROFILE
+    global _GLOBAL_PROFILE, _PROFILE_DOWNLOAD_CONNECTED
     if _GLOBAL_PROFILE is None:
         _GLOBAL_PROFILE = QWebEngineProfile("AlinvaultStorageProfile")
         _GLOBAL_PROFILE.setCachePath(str(CACHE_DIR))
@@ -84,8 +92,19 @@ def get_global_profile():
         _GLOBAL_PROFILE.setHttpCacheType(
             QWebEngineProfile.HttpCacheType.DiskHttpCache
         )
+        # V6: bound Chromium HTTP cache so long sessions do not grow freely.
+        try:
+            _GLOBAL_PROFILE.setHttpCacheMaximumSize(256 * 1024 * 1024)
+        except Exception:
+            pass
         user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         _GLOBAL_PROFILE.setHttpUserAgent(user_agent)
+
+    # QWebEngineProfile.downloadRequested is a profile-wide signal.
+    # Connect it exactly once instead of once per tab/page.
+    if not _PROFILE_DOWNLOAD_CONNECTED:
+        _GLOBAL_PROFILE.downloadRequested.connect(_handle_profile_download)
+        _PROFILE_DOWNLOAD_CONNECTED = True
     return _GLOBAL_PROFILE
 
 
@@ -153,12 +172,22 @@ class DownloadHandler:
         self.downloads = []
         self.download_progress = {}
         self.download_widgets = {}
+        self.active_dialogs = {}
+        self.processed_downloads = set()
+        self.download_completed = {}
 
     def handle_download(self, download: QWebEngineDownloadRequest, parent=None):
+        download_id = id(download)
+        if download_id in self.processed_downloads:
+            return
+
+        self.processed_downloads.add(download_id)
+
         DOWNLOADS_DIR.mkdir(exist_ok=True)
         suggested_filename = download.suggestedFileName()
         if not suggested_filename:
             suggested_filename = f"download_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
         file_path = DOWNLOADS_DIR / suggested_filename
         counter = 1
         while file_path.exists():
@@ -166,23 +195,40 @@ class DownloadHandler:
             new_name = f"{name}_{counter}{ext}"
             file_path = DOWNLOADS_DIR / new_name
             counter += 1
-        download.setDownloadDirectory(str(DOWNLOADS_DIR))
-        download.setDownloadFileName(file_path.name)
-        download.accept()
-        download_id = id(download)
+
+        if download.state() == QWebEngineDownloadRequest.DownloadState.DownloadRequested:
+            download.setDownloadDirectory(str(DOWNLOADS_DIR))
+            download.setDownloadFileName(file_path.name)
+            download.accept()
+
         self.download_progress[download_id] = 0
-        progress_dialog = QDialog(parent) if parent else QDialog()
+        self.download_completed[download_id] = False
+
+        main_window = QApplication.activeWindow() or parent
+        if not main_window:
+            for widget in QApplication.topLevelWidgets():
+                if isinstance(widget, AlinvaultWindow):
+                    main_window = widget
+                    break
+
+        progress_dialog = QDialog(main_window)
         progress_dialog.setWindowTitle("Downloading")
         progress_dialog.setFixedSize(400, 120)
         progress_dialog.setWindowFlags(
-            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint
+        )
+
+        self.active_dialogs[download_id] = progress_dialog
+
         layout = QVBoxLayout(progress_dialog)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
+
         filename_label = QLabel(f"Downloading: {file_path.name}")
         filename_label.setStyleSheet(
             "font-weight: 500; font-size: 13px; color: #e8e8f0;")
         layout.addWidget(filename_label)
+
         progress_bar = QProgressBar()
         progress_bar.setRange(0, 100)
         progress_bar.setTextVisible(True)
@@ -199,9 +245,11 @@ class DownloadHandler:
             }
         """)
         layout.addWidget(progress_bar)
+
         status_label = QLabel("Starting download...")
         status_label.setStyleSheet("color: #8888a0; font-size: 12px;")
         layout.addWidget(status_label)
+
         progress_dialog.setStyleSheet("""
             QDialog {
                 background: #0d0d1a;
@@ -209,44 +257,118 @@ class DownloadHandler:
                 border: 1px solid #1a1a2e;
             }
         """)
+
+        def safe_close_dialog():
+            try:
+                if download_id in self.active_dialogs:
+                    dialog = self.active_dialogs[download_id]
+                    if dialog:
+                        try:
+                            dialog.hide()
+                            dialog.close()
+                            dialog.deleteLater()
+                        except (RuntimeError, AttributeError):
+                            pass
+                    del self.active_dialogs[download_id]
+                if download_id in self.download_progress:
+                    del self.download_progress[download_id]
+                if download_id in self.processed_downloads:
+                    self.processed_downloads.discard(download_id)
+                if download_id in self.download_completed:
+                    self.download_completed[download_id] = True
+            except (RuntimeError, AttributeError, KeyError) as e:
+                print(f"Error in safe_close_dialog: {e}")
+                try:
+                    if download_id in self.active_dialogs:
+                        del self.active_dialogs[download_id]
+                except:
+                    pass
+
+        def on_progress_update(received, total):
+            if total > 0:
+                progress = int((received / total) * 100)
+                self.download_progress[download_id] = progress
+                try:
+                    progress_bar.setValue(progress)
+                    status_label.setText(
+                        f"Downloaded: {self.format_size(received)} / {self.format_size(total)}"
+                    )
+                    if progress >= 100:
+                        QTimer.singleShot(1000, safe_close_dialog)
+                except RuntimeError:
+                    pass
+
+        def on_download_finished():
+            if self.download_completed.get(download_id, False):
+                return
+            try:
+                state = download.state()
+                if state == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
+                    try:
+                        progress_bar.setValue(100)
+                        status_label.setText("Download complete!")
+                    except RuntimeError:
+                        pass
+
+                    main_win = QApplication.activeWindow()
+                    if main_win:
+                        QMessageBox.information(
+                            main_win,
+                            "Download Complete",
+                            f'"{download.downloadFileName()}" has been downloaded!\nLocation: {DOWNLOADS_DIR}'
+                        )
+                        if hasattr(main_win, 'refresh_files'):
+                            main_win.refresh_files()
+                safe_close_dialog()
+            except (RuntimeError, AttributeError) as e:
+                print(f"Error in on_download_finished: {e}")
+                safe_close_dialog()
+
+        def on_state_changed(state):
+            if state == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
+                on_download_finished()
+            elif state in (QWebEngineDownloadRequest.DownloadState.DownloadCancelled,
+                           QWebEngineDownloadRequest.DownloadState.DownloadInterrupted):
+                safe_close_dialog()
+
+        try:
+            download.downloadProgress.connect(on_progress_update)
+        except AttributeError:
+            try:
+                download.progressChanged.connect(on_progress_update)
+            except AttributeError:
+                pass
+
+        download.stateChanged.connect(on_state_changed)
+
+        def check_download_status():
+            try:
+                if download_id not in self.active_dialogs:
+                    return
+                if download.isFinished():
+                    on_download_finished()
+                    return
+                QTimer.singleShot(500, check_download_status)
+            except (RuntimeError, AttributeError) as e:
+                print(f"Error in check_download_status: {e}")
+                safe_close_dialog()
+
+        QTimer.singleShot(500, check_download_status)
+
+        if download not in self.downloads:
+            self.downloads.append(download)
+
         progress_dialog.show()
 
-        def update_progress(bytes_received, bytes_total):
-            if bytes_total > 0:
-                progress = int((bytes_received / bytes_total) * 100)
-                self.download_progress[download_id] = progress
-                progress_bar.setValue(progress)
-                status_label.setText(
-                    f"Downloaded: {self.format_size(bytes_received)} / {self.format_size(bytes_total)}")
+        def cleanup():
+            try:
+                safe_close_dialog()
+                if download in self.downloads:
+                    self.downloads.remove(download)
+            except (KeyError, ValueError):
+                pass
 
-        def download_finished():
-            if download.state() == QWebEngineDownloadRequest.DownloadState.DownloadCompleted:
-                progress_bar.setValue(100)
-                status_label.setText("Download complete!")
-                filename = download.downloadFileName()
-                QMessageBox.information(
-                    parent or progress_dialog,
-                    "Download Complete",
-                    f'"{filename}" has been downloaded!\nYou can view at Downloads/alinvault'
-                )
-                if progress_dialog:
-                    progress_dialog.accept()
-                if parent and hasattr(parent, 'refresh_files'):
-                    parent.refresh_files()
-            elif download.state() == QWebEngineDownloadRequest.DownloadState.DownloadCancelled:
-                status_label.setText("Download cancelled")
-                QTimer.singleShot(1500, progress_dialog.accept)
-            elif download.state() == QWebEngineDownloadRequest.DownloadState.DownloadInterrupted:
-                status_label.setText("Download interrupted")
-                QTimer.singleShot(1500, progress_dialog.accept)
-            if download_id in self.download_progress:
-                del self.download_progress[download_id]
-
-        download.downloadProgress.connect(update_progress)
-        download.finished.connect(download_finished)
-        download.stateChanged.connect(
-            lambda state: self.state_changed(download, state, progress_dialog))
-        self.downloads.append(download)
+        QTimer.singleShot(30000, cleanup)
 
     def format_size(self, bytes_size):
         if bytes_size < 1024:
@@ -258,16 +380,6 @@ class DownloadHandler:
         else:
             return f"{bytes_size/(1024*1024*1024):.2f} GB"
 
-    def state_changed(self, download, state, dialog):
-        if state == QWebEngineDownloadRequest.DownloadState.DownloadCancelled:
-            print(f"Download cancelled: {download.downloadFileName()}")
-            if dialog:
-                QTimer.singleShot(1000, dialog.accept)
-        elif state == QWebEngineDownloadRequest.DownloadState.DownloadInterrupted:
-            print(f"Download interrupted: {download.downloadFileName()}")
-            if dialog:
-                QTimer.singleShot(1000, dialog.accept)
-
 
 class CustomWebEnginePage(QWebEnginePage):
     def __init__(self, profile, parent=None):
@@ -276,8 +388,6 @@ class CustomWebEnginePage(QWebEnginePage):
             self.permissionRequested.connect(self.handle_permission)
         except Exception:
             pass
-        self.download_handler = DownloadHandler()
-        self.profile().downloadRequested.connect(self.on_download_requested)
 
     def handle_permission(self, permission):
         try:
@@ -288,14 +398,14 @@ class CustomWebEnginePage(QWebEnginePage):
                 QWebEnginePage.PermissionPolicy.PermissionGrantedByUser,
             )
 
-    def on_download_requested(self, download):
-        parent = self.parent() if self.parent() else None
-        self.download_handler.handle_download(download, parent)
-
 
 class WebTabContent(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._pending_url = ""
+        self._loaded_once = False
+        self._last_active = datetime.now()
+        self._lifecycle_state = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -351,243 +461,15 @@ class WebTabContent(QWidget):
         page = CustomWebEnginePage(profile, self.web)
 
         script_code = """
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-
-        Object.defineProperty(navigator, 'languages', {
-            get: () => ['en-US', 'en', 'en-GB']
-        });
-
-        Object.defineProperty(navigator, 'platform', {
-            get: () => 'Win32'
-        });
-
-        Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => 8
-        });
-
-        window.chrome = {
-            runtime: {},
-            loadTimes: function() {},
-            csi: function() {},
-            app: {}
-        };
-
-        delete navigator.webdriver;
-
-        if (!navigator.permissions) {
-            navigator.permissions = {
-                query: (desc) => {
-                    if (desc.name === 'notifications') {
-                        return Promise.resolve({state: 'granted'});
-                    }
-                    return Promise.resolve({state: 'prompt'});
-                }
-            };
-        } else {
-            const originalQuery = navigator.permissions.query;
-            navigator.permissions.query = function(desc) {
-                if (desc.name === 'notifications') {
-                    return Promise.resolve({state: 'granted'});
-                }
-                return originalQuery.call(this, desc);
-            };
-        }
-
-        if (!navigator.mediaDevices) {
-            navigator.mediaDevices = {};
-        }
-        if (!navigator.mediaDevices.getUserMedia) {
-            navigator.mediaDevices.getUserMedia = function(constraints) {
-                return new Promise((resolve, reject) => {
-                    resolve(new MediaStream());
-                });
-            };
-        }
-
-        if (!navigator.geolocation) {
-            navigator.geolocation = {
-                getCurrentPosition: function(success, error, options) {
-                    if (success) {
-                        success({
-                            coords: {
-                                latitude: 0,
-                                longitude: 0,
-                                accuracy: 0,
-                                altitude: null,
-                                altitudeAccuracy: null,
-                                heading: null,
-                                speed: null
-                            },
-                            timestamp: Date.now()
-                        });
-                    }
-                },
-                watchPosition: function(success, error, options) {
-                    if (success) {
-                        success({
-                            coords: {
-                                latitude: 0,
-                                longitude: 0,
-                                accuracy: 0,
-                                altitude: null,
-                                altitudeAccuracy: null,
-                                heading: null,
-                                speed: null
-                            },
-                            timestamp: Date.now()
-                        });
-                    }
-                    return 0;
-                },
-                clearWatch: function(id) {}
-            };
-        }
-
-        if (!navigator.getBattery) {
-            navigator.getBattery = function() {
-                return Promise.resolve({
-                    charging: true,
-                    chargingTime: 0,
-                    dischargingTime: Infinity,
-                    level: 1
-                });
-            };
-        }
-
-        if (!navigator.vibrate) {
-            navigator.vibrate = function() { return true; };
-        }
-
-        if (!navigator.connection) {
-            navigator.connection = {
-                effectiveType: '4g',
-                rtt: 50,
-                downlink: 10,
-                saveData: false
-            };
-        }
-
-        if (!navigator.storage) {
-            navigator.storage = {
-                estimate: function() {
-                    return Promise.resolve({
-                        quota: 1073741824,
-                        usage: 0
-                    });
-                }
-            };
-        }
-
-        if (!navigator.clipboard) {
-            navigator.clipboard = {
-                writeText: function(text) {
-                    return Promise.resolve();
-                },
-                readText: function() {
-                    return Promise.resolve('');
-                }
-            };
-        }
-
-        if (!navigator.permissions) {
-            navigator.permissions = {
-                query: function(desc) {
-                    return Promise.resolve({state: 'granted'});
-                },
-                request: function(desc) {
-                    return Promise.resolve({state: 'granted'});
-                }
-            };
-        } else {
-            const origQuery = navigator.permissions.query;
-            navigator.permissions.query = function(desc) {
-                return Promise.resolve({state: 'granted'});
-            };
-            if (navigator.permissions.request) {
-                const origRequest = navigator.permissions.request;
-                navigator.permissions.request = function(desc) {
-                    return Promise.resolve({state: 'granted'});
-                };
-            }
-        }
-
-        if (!navigator.getUserMedia) {
-            navigator.getUserMedia = function(constraints, success, error) {
-                if (success) {
-                    success(new MediaStream());
-                }
-            };
-        }
-
-        if (!window.Notification) {
-            window.Notification = function(title, options) {
-                this.title = title;
-                this.options = options;
-                this.onclick = null;
-                this.onclose = null;
-                this.onerror = null;
-                this.onshow = null;
-                this.close = function() {};
-            };
-            window.Notification.permission = 'granted';
-            window.Notification.requestPermission = function(callback) {
-                if (callback) {
-                    callback('granted');
-                }
-                return Promise.resolve('granted');
-            };
-        } else {
-            if (Notification.permission !== 'granted') {
-                Notification.permission = 'granted';
-            }
-            const origRequestPermission = Notification.requestPermission;
-            Notification.requestPermission = function(callback) {
-                if (callback) {
-                    callback('granted');
-                }
-                return Promise.resolve('granted');
-            };
-        }
-
-        if (!window.speechSynthesis) {
-            window.speechSynthesis = {
-                speaking: false,
-                paused: false,
-                pending: false,
-                getVoices: function() { return []; },
-                speak: function(utterance) {},
-                cancel: function() {},
-                pause: function() {},
-                resume: function() {}
-            };
-        }
-
-        if (!window.speechRecognition) {
-            window.speechRecognition = function() {};
-            window.SpeechRecognition = function() {};
-        }
-
-        if (!window.webkitSpeechRecognition) {
-            window.webkitSpeechRecognition = function() {};
-        }
-
-        if (!window.indexedDB) {
-            window.indexedDB = {
-                open: function() {
-                    return {
-                        result: null,
-                        error: null,
-                        onerror: null,
-                        onsuccess: null,
-                        onupgradeneeded: null
-                    };
-                },
-                deleteDatabase: function() {},
-                cmp: function() { return 0; }
-            };
-        }
+        // Keep only the compatibility shim Alinvault actually needs.
+        // Avoid overriding permissions, media, storage, geolocation,
+        // notifications and IndexedDB on every document.
+        try {
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+                configurable: true
+            });
+        } catch (e) {}
         """
 
         script = QWebEngineScript()
@@ -595,7 +477,7 @@ class WebTabContent(QWidget):
         script.setInjectionPoint(
             QWebEngineScript.InjectionPoint.DocumentCreation)
         script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        script.setRunsOnSubFrames(True)
+        script.setRunsOnSubFrames(False)
         page.scripts().insert(script)
 
         self.web.setPage(page)
@@ -613,7 +495,7 @@ class WebTabContent(QWidget):
         settings.setAttribute(
             QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
         settings.setAttribute(
-            QWebEngineSettings.WebAttribute.PluginsEnabled, True)
+            QWebEngineSettings.WebAttribute.PluginsEnabled, False)
         settings.setAttribute(
             QWebEngineSettings.WebAttribute.AutoLoadImages, True)
         settings.setAttribute(
@@ -631,7 +513,7 @@ class WebTabContent(QWidget):
         settings.setAttribute(
             QWebEngineSettings.WebAttribute.HyperlinkAuditingEnabled, False)
         settings.setAttribute(
-            QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
+            QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, False)
         settings.setAttribute(
             QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
         settings.setAttribute(
@@ -669,12 +551,65 @@ class WebTabContent(QWidget):
     def reload_page(self):
         self.web.reload()
 
+    def set_pending_url(self, url):
+        self._pending_url = url or "https://example.com"
+        if not self.url_bar.text():
+            self.url_bar.setText(self._pending_url)
+
+    def ensure_loaded(self):
+        self._last_active = datetime.now()
+        page = self.web.page()
+        if self._lifecycle_state != "active":
+            try:
+                page.setLifecycleState(QWebEnginePage.LifecycleState.Active)
+                self._lifecycle_state = "active"
+            except Exception:
+                pass
+
+        if not self._loaded_once:
+            self._loaded_once = True
+            target = self._pending_url or self.url_bar.text() or "https://example.com"
+            self.progress.show()
+            self.web.load(QUrl(target))
+
+    def freeze(self):
+        if not self._loaded_once:
+            return
+        if self._lifecycle_state == "frozen":
+            return
+        try:
+            self.web.page().setLifecycleState(QWebEnginePage.LifecycleState.Frozen)
+            self._lifecycle_state = "frozen"
+        except Exception:
+            pass
+
+    def discard(self):
+        if not self._loaded_once:
+            return
+        if self._lifecycle_state == "discarded":
+            return
+        try:
+            self.web.page().setLifecycleState(QWebEnginePage.LifecycleState.Discarded)
+            self._lifecycle_state = "discarded"
+        except Exception:
+            self.freeze()
+
     def load_url(self, url):
+        self._pending_url = url
+        self._loaded_once = True
+        self._last_active = datetime.now()
         self.progress.show()
+        if self._lifecycle_state != "active":
+            try:
+                self.web.page().setLifecycleState(QWebEnginePage.LifecycleState.Active)
+                self._lifecycle_state = "active"
+            except Exception:
+                pass
         self.web.load(QUrl(url))
 
     def get_current_url(self):
-        return self.url_bar.text()
+        current = self.web.url().toString()
+        return current or self.url_bar.text() or self._pending_url
 
 
 class AddTabDialog(QDialog):
@@ -1045,7 +980,7 @@ class NotesWidget(ThemeAwareWidget):
         self.unsaved_changes = False
         self.autosave_timer = QTimer()
         self.autosave_timer.timeout.connect(self.autosave)
-        self.autosave_timer.start(3000)
+        self.autosave_timer.start(10000)
         self.is_new_unsaved_note = False
         self.new_note_counter = 1
 
@@ -1911,9 +1846,7 @@ class ClipboardWidget(ThemeAwareWidget):
         self.datetime_widget = DateTimeWidget()
         layout.addWidget(self.datetime_widget)
 
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.check_clipboard)
-        self.timer.start(500)
+        self.clipboard.dataChanged.connect(self.check_clipboard)
 
         self.refresh()
         self.apply_style()
@@ -2156,164 +2089,290 @@ class ClipboardWidget(ThemeAwareWidget):
 class DownloadsWidget(ThemeAwareWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.view_mode = "list"
+        self._last_signature = None
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(32, 32, 32, 32)
-        layout.setSpacing(16)
+        layout.setSpacing(12)
 
+        header_row = QHBoxLayout()
         header = QLabel("Downloads")
         header.setObjectName("sectionHeader")
-        layout.addWidget(header)
+        header_row.addWidget(header)
+        header_row.addStretch()
+
+        self.selection_label = QLabel("0 selected")
+        self.selection_label.setObjectName("infoLabel")
+        header_row.addWidget(self.selection_label)
+        layout.addLayout(header_row)
 
         info = QLabel(f"{DOWNLOADS_DIR}")
         info.setObjectName("infoLabel")
         layout.addWidget(info)
 
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+
         self.open_btn = QPushButton("Open Folder")
         self.open_btn.setObjectName("actionBtn")
         self.open_btn.clicked.connect(self.open_folder)
-        layout.addWidget(self.open_btn)
+
+        self.list_btn = QPushButton("☰ List")
+        self.list_btn.setObjectName("viewBtn")
+        self.list_btn.setCheckable(True)
+        self.list_btn.setChecked(True)
+        self.list_btn.clicked.connect(lambda: self.set_view_mode("list"))
+
+        self.grid_btn = QPushButton("▦ Grid")
+        self.grid_btn.setObjectName("viewBtn")
+        self.grid_btn.setCheckable(True)
+        self.grid_btn.clicked.connect(lambda: self.set_view_mode("grid"))
+
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.setObjectName("secondaryBtn")
+        self.select_all_btn.clicked.connect(self.select_all_files)
+
+        self.rename_btn = QPushButton("Rename")
+        self.rename_btn.setObjectName("secondaryBtn")
+        self.rename_btn.clicked.connect(self.rename_selected)
+
+        self.delete_btn = QPushButton("Delete")
+        self.delete_btn.setObjectName("dangerBtn")
+        self.delete_btn.clicked.connect(self.delete_selected)
+
+        controls.addWidget(self.open_btn)
+        controls.addSpacing(8)
+        controls.addWidget(self.list_btn)
+        controls.addWidget(self.grid_btn)
+        controls.addStretch()
+        controls.addWidget(self.select_all_btn)
+        controls.addWidget(self.rename_btn)
+        controls.addWidget(self.delete_btn)
+        layout.addLayout(controls)
 
         self.file_list = QListWidget()
         self.file_list.setObjectName("itemList")
+        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.file_list.setUniformItemSizes(True)
         self.file_list.itemDoubleClicked.connect(self.open_file)
+        self.file_list.itemSelectionChanged.connect(self.update_selection_label)
         layout.addWidget(self.file_list)
 
         self.datetime_widget = DateTimeWidget()
         layout.addWidget(self.datetime_widget)
 
-        self.timer = QTimer()
+        self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh_files)
-        self.timer.start(3000)
-        self.refresh_files()
-
+        self.timer.start(15000)
+        self.refresh_files(force=True)
         self.apply_style()
 
-    def refresh_files(self):
+    def _files(self):
+        DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+        files = []
+        for path in DOWNLOADS_DIR.iterdir():
+            try:
+                stat = path.stat()
+                files.append((path, stat.st_mtime_ns, stat.st_size))
+            except (OSError, FileNotFoundError):
+                continue
+        files.sort(key=lambda x: x[1], reverse=True)
+        return files
+
+    def refresh_files(self, force=False):
+        files = self._files()
+        signature = tuple((str(p), mtime, size) for p, mtime, size in files)
+        if not force and signature == self._last_signature:
+            return
+
+        selected = {item.data(Qt.ItemDataRole.UserRole) for item in self.file_list.selectedItems()}
+        self.file_list.setUpdatesEnabled(False)
         self.file_list.clear()
-        if DOWNLOADS_DIR.exists():
-            files = list(DOWNLOADS_DIR.iterdir())
-            files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-            for f in files:
-                size = f.stat().st_size
-                size_str = f"{size} B"
-                if size > 1024:
-                    size_str = f"{size/1024:.1f} KB"
-                if size > 1024*1024:
-                    size_str = f"{size/(1024*1024):.1f} MB"
-                item = QListWidgetItem(f"{f.name}  ·  {size_str}")
-                item.setData(Qt.ItemDataRole.UserRole, str(f))
-                self.file_list.addItem(item)
+
+        for path, _, size in files:
+            if path.is_dir():
+                size_str = "Folder"
+                icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
+            else:
+                size_str = self.format_size(size)
+                icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+
+            if self.view_mode == "grid":
+                text = f"{path.name}\n{size_str}"
+            else:
+                modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%d/%m/%Y %H:%M")
+                text = f"{path.name}  ·  {size_str}  ·  {modified}"
+
+            item = QListWidgetItem(icon, text)
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            item.setToolTip(str(path))
+            self.file_list.addItem(item)
+            if str(path) in selected:
+                item.setSelected(True)
+
+        self.file_list.setUpdatesEnabled(True)
+        self._last_signature = signature
+        self.update_selection_label()
+
+    def format_size(self, size):
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = float(size)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+            value /= 1024
+
+    def set_view_mode(self, mode):
+        self.view_mode = mode
+        self.list_btn.setChecked(mode == "list")
+        self.grid_btn.setChecked(mode == "grid")
+
+        if mode == "grid":
+            self.file_list.setViewMode(QListView.ViewMode.IconMode)
+            self.file_list.setResizeMode(QListView.ResizeMode.Adjust)
+            self.file_list.setMovement(QListView.Movement.Static)
+            self.file_list.setWrapping(True)
+            self.file_list.setIconSize(QSize(48, 48))
+            self.file_list.setGridSize(QSize(180, 100))
+            self.file_list.setWordWrap(True)
+        else:
+            self.file_list.setViewMode(QListView.ViewMode.ListMode)
+            self.file_list.setResizeMode(QListView.ResizeMode.Adjust)
+            self.file_list.setMovement(QListView.Movement.Static)
+            self.file_list.setWrapping(False)
+            self.file_list.setIconSize(QSize(24, 24))
+            self.file_list.setGridSize(QSize())
+
+        self._last_signature = None
+        self.refresh_files(force=True)
+
+    def selected_paths(self):
+        paths = []
+        for item in self.file_list.selectedItems():
+            value = item.data(Qt.ItemDataRole.UserRole)
+            if value:
+                paths.append(Path(value))
+        return paths
+
+    def update_selection_label(self):
+        count = len(self.file_list.selectedItems())
+        self.selection_label.setText(f"{count} selected")
+        self.rename_btn.setEnabled(count == 1)
+        self.delete_btn.setEnabled(count > 0)
+
+    def select_all_files(self):
+        self.file_list.selectAll()
 
     def open_folder(self):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(DOWNLOADS_DIR)))
 
     def open_file(self, item):
         file_path = item.data(Qt.ItemDataRole.UserRole)
-        if file_path:
+        if file_path and Path(file_path).exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(file_path))
+
+    def rename_selected(self):
+        paths = self.selected_paths()
+        if len(paths) != 1:
+            QMessageBox.information(self, "Rename", "Select exactly one file or folder to rename.")
+            return
+
+        source = paths[0]
+        new_name, ok = QInputDialog.getText(self, "Rename", "New name:", text=source.name)
+        new_name = new_name.strip()
+        if not ok or not new_name or new_name == source.name:
+            return
+        if new_name in (".", "..") or "/" in new_name or "\\" in new_name:
+            QMessageBox.warning(self, "Invalid Name", "Please enter a valid file name.")
+            return
+
+        target = source.with_name(new_name)
+        if target.exists():
+            QMessageBox.warning(self, "Rename", "A file or folder with that name already exists.")
+            return
+        try:
+            source.rename(target)
+            self._last_signature = None
+            self.refresh_files(force=True)
+        except OSError as e:
+            QMessageBox.critical(self, "Rename Failed", str(e))
+
+    def delete_selected(self):
+        paths = self.selected_paths()
+        if not paths:
+            return
+
+        label = "item" if len(paths) == 1 else "items"
+        reply = QMessageBox.question(
+            self,
+            "Delete Files",
+            f"Permanently delete {len(paths)} selected {label}?\n\nThis cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        errors = []
+        for path in paths:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
+            except OSError as e:
+                errors.append(f"{path.name}: {e}")
+
+        self._last_signature = None
+        self.refresh_files(force=True)
+        if errors:
+            QMessageBox.warning(self, "Delete", "Some items could not be deleted:\n" + "\n".join(errors[:8]))
 
     def apply_style(self):
         if self.dark_mode:
             self.setStyleSheet("""
-                DownloadsWidget {
-                    background: #0d0d1a;
+                DownloadsWidget { background: #0d0d1a; }
+                #sectionHeader { font-size: 20px; font-weight: 700; color: #e8e8f0; }
+                #infoLabel { color: #8888a0; font-size: 12px; font-weight: 500; }
+                #actionBtn, #secondaryBtn, #viewBtn, #dangerBtn {
+                    border: none; padding: 8px 14px; border-radius: 8px;
+                    font-weight: 600; font-size: 12px;
                 }
-                #sectionHeader {
-                    font-size: 20px;
-                    font-weight: 700;
-                    color: #e8e8f0;
-                    letter-spacing: -0.3px;
-                }
-                #infoLabel {
-                    color: #8888a0;
-                    font-size: 13px;
-                    font-weight: 500;
-                }
-                #actionBtn {
-                    background: #6c8cff;
-                    color: white;
-                    border: none;
-                    padding: 8px 18px;
-                    border-radius: 8px;
-                    font-weight: 600;
-                    font-size: 12px;
-                }
-                #actionBtn:hover {
-                    background: #5a7ce7;
-                }
-                #itemList {
-                    background: #0d0d1a;
-                    border: 1.5px solid #1a1a2e;
-                    border-radius: 10px;
-                    padding: 4px;
-                }
-                #itemList::item {
-                    padding: 10px 14px;
-                    border-radius: 6px;
-                    font-size: 13px;
-                    color: #e8e8f0;
-                }
-                #itemList::item:selected {
-                    background: #2a2a4a;
-                    color: #6c8cff;
-                }
-                #itemList::item:hover {
-                    background: #141424;
-                }
-                QLabel {
-                    color: #e8e8f0;
-                }
+                #actionBtn { background: #6c8cff; color: white; }
+                #actionBtn:hover { background: #5a7ce7; }
+                #secondaryBtn, #viewBtn { background: #1a1a2e; color: #d8d8e8; }
+                #secondaryBtn:hover, #viewBtn:hover, #viewBtn:checked { background: #2a2a4a; color: #8ea5ff; }
+                #dangerBtn { background: #3a1d24; color: #ff9aa8; }
+                #dangerBtn:hover { background: #522630; }
+                #dangerBtn:disabled, #secondaryBtn:disabled { color: #555568; background: #151522; }
+                #itemList { background: #0d0d1a; border: 1.5px solid #1a1a2e; border-radius: 10px; padding: 6px; }
+                #itemList::item { padding: 9px 12px; border-radius: 7px; color: #e8e8f0; }
+                #itemList::item:selected { background: #2a2a4a; color: #8ea5ff; }
+                #itemList::item:hover { background: #141424; }
+                QLabel { color: #e8e8f0; }
             """)
         else:
             self.setStyleSheet("""
-                DownloadsWidget {
-                    background: #f5f5fa;
+                DownloadsWidget { background: #f5f5fa; }
+                #sectionHeader { font-size: 20px; font-weight: 700; color: #1a1a2e; }
+                #infoLabel { color: #6b6b80; font-size: 12px; font-weight: 500; }
+                #actionBtn, #secondaryBtn, #viewBtn, #dangerBtn {
+                    border: none; padding: 8px 14px; border-radius: 8px;
+                    font-weight: 600; font-size: 12px;
                 }
-                #sectionHeader {
-                    font-size: 20px;
-                    font-weight: 700;
-                    color: #1a1a2e;
-                    letter-spacing: -0.3px;
-                }
-                #infoLabel {
-                    color: #6b6b80;
-                    font-size: 13px;
-                    font-weight: 500;
-                }
-                #actionBtn {
-                    background: #4a6cf7;
-                    color: white;
-                    border: none;
-                    padding: 8px 18px;
-                    border-radius: 8px;
-                    font-weight: 600;
-                    font-size: 12px;
-                }
-                #actionBtn:hover {
-                    background: #3a5cd7;
-                }
-                #itemList {
-                    background: #ffffff;
-                    border: 1.5px solid #e0e0e8;
-                    border-radius: 10px;
-                    padding: 4px;
-                }
-                #itemList::item {
-                    padding: 10px 14px;
-                    border-radius: 6px;
-                    font-size: 13px;
-                    color: #1a1a2e;
-                }
-                #itemList::item:selected {
-                    background: #e8ecff;
-                    color: #4a6cf7;
-                }
-                #itemList::item:hover {
-                    background: #f0f0f5;
-                }
-                QLabel {
-                    color: #1a1a2e;
-                }
+                #actionBtn { background: #4a6cf7; color: white; }
+                #actionBtn:hover { background: #3a5cd7; }
+                #secondaryBtn, #viewBtn { background: #e9e9f2; color: #303044; }
+                #secondaryBtn:hover, #viewBtn:hover, #viewBtn:checked { background: #e0e5ff; color: #4a6cf7; }
+                #dangerBtn { background: #ffe5e8; color: #b42335; }
+                #dangerBtn:hover { background: #ffd5da; }
+                #dangerBtn:disabled, #secondaryBtn:disabled { color: #aaaab5; background: #ededf2; }
+                #itemList { background: #ffffff; border: 1.5px solid #e0e0e8; border-radius: 10px; padding: 6px; }
+                #itemList::item { padding: 9px 12px; border-radius: 7px; color: #1a1a2e; }
+                #itemList::item:selected { background: #e8ecff; color: #4a6cf7; }
+                #itemList::item:hover { background: #f0f0f5; }
+                QLabel { color: #1a1a2e; }
             """)
         self.update()
 
@@ -2321,7 +2380,7 @@ class DownloadsWidget(ThemeAwareWidget):
 class AlinvaultWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} V5")
         self.setMinimumSize(1200, 800)
         self.sidebar_visible = True
         self.dark_mode = True
@@ -2411,6 +2470,7 @@ class AlinvaultWindow(QMainWindow):
         self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
         self.tabs.setMovable(True)
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         content_layout.addWidget(self.tabs, 1)
 
         layout.addWidget(content)
@@ -2420,16 +2480,22 @@ class AlinvaultWindow(QMainWindow):
         self.load_session_data()
         self.apply_theme()
         self.setup_tray()
+        self.setup_debug_profiler()
 
         self.sidebar_btns["web"].setChecked(True)
 
         self.save_timer = QTimer()
         self.save_timer.timeout.connect(self.force_save_all)
-        self.save_timer.start(5000)
+        self.save_timer.start(60000)
 
         self.session_save_timer = QTimer()
         self.session_save_timer.timeout.connect(self.save_session_data)
-        self.session_save_timer.start(10000)
+        self.session_save_timer.start(60000)
+
+        self.hibernate_timer = QTimer()
+        self.hibernate_timer.timeout.connect(self.hibernate_inactive_tabs)
+        self.hibernate_timer.start(60000)
+        QTimer.singleShot(0, lambda: self.on_tab_changed(self.tabs.currentIndex()))
 
     def load_session_data(self):
         session = self.session_mgr.load_session()
@@ -2443,12 +2509,20 @@ class AlinvaultWindow(QMainWindow):
         if tabs_data:
             for tab in tabs_data:
                 self.add_web_tab(tab.get('name', 'Tab'),
-                                 tab.get('url', 'https://example.com'))
+                                 tab.get('url', 'https://example.com'), activate=False)
                 if hasattr(self, '_tab_data'):
                     idx = self.tabs.count() - 1
                     self._tab_data[idx] = tab
 
-            if 0 <= current_tab < self.tabs.count():
+            whatsapp_idx = next(
+                (i for i in range(self.tabs.count())
+                 if isinstance(self.tabs.widget(i), WebTabContent)
+                 and 'web.whatsapp.com' in self.tabs.widget(i)._pending_url),
+                None
+            )
+            if whatsapp_idx is not None:
+                self.tabs.setCurrentIndex(whatsapp_idx)
+            elif 0 <= current_tab < self.tabs.count():
                 self.tabs.setCurrentIndex(current_tab)
         else:
             self.load_tabs()
@@ -2490,7 +2564,6 @@ class AlinvaultWindow(QMainWindow):
         notes_widget = self.tool_widgets.get('notes')
         if notes_widget and hasattr(notes_widget, 'force_save'):
             notes_widget.force_save()
-        self.save_session_data()
 
     def toggle_sidebar(self):
         self.sidebar_visible = not self.sidebar_visible
@@ -2531,20 +2604,62 @@ class AlinvaultWindow(QMainWindow):
                 pass
 
         for tab in tabs:
-            self.add_web_tab(tab['name'], tab['url'])
+            self.add_web_tab(tab['name'], tab['url'], activate=False)
 
         if self.tabs.count() > 0:
-            self.tabs.setCurrentIndex(0)
+            whatsapp_idx = next(
+                (i for i in range(self.tabs.count())
+                 if isinstance(self.tabs.widget(i), WebTabContent)
+                 and 'web.whatsapp.com' in self.tabs.widget(i)._pending_url),
+                0
+            )
+            self.tabs.setCurrentIndex(whatsapp_idx)
+            self.on_tab_changed(whatsapp_idx)
 
-    def add_web_tab(self, name, url):
+    def add_web_tab(self, name, url, activate=True):
         content = WebTabContent(self)
-        content.load_url(url)
+        content.set_pending_url(url)
         idx = self.tabs.addTab(content, name)
-        self.tabs.setCurrentIndex(idx)
 
         if not hasattr(self, '_tab_data'):
             self._tab_data = {}
         self._tab_data[idx] = {'name': name, 'url': url}
+
+        if activate:
+            self.tabs.setCurrentIndex(idx)
+            content.ensure_loaded()
+        return idx
+
+    def on_tab_changed(self, idx):
+        if idx < 0:
+            return
+        current = self.tabs.widget(idx)
+        if isinstance(current, WebTabContent):
+            current.ensure_loaded()
+
+        for i in range(self.tabs.count()):
+            if i == idx:
+                continue
+            widget = self.tabs.widget(i)
+            if isinstance(widget, WebTabContent):
+                widget.freeze()
+
+    def hibernate_inactive_tabs(self):
+        now = datetime.now()
+        current_idx = self.tabs.currentIndex()
+        for i in range(self.tabs.count()):
+            if i == current_idx:
+                continue
+            widget = self.tabs.widget(i)
+            if not isinstance(widget, WebTabContent) or not widget._loaded_once:
+                continue
+            idle_seconds = (now - widget._last_active).total_seconds()
+            # V6 memory policy: freeze immediately, then let Chromium release
+            # the renderer of genuinely idle tabs after three minutes.
+            if idle_seconds >= 180:
+                widget.discard()
+            else:
+                widget.freeze()
 
     def add_custom_tab(self):
         dialog = AddTabDialog(self)
@@ -2586,9 +2701,15 @@ class AlinvaultWindow(QMainWindow):
 
         if tool_name == 'web':
             for i in range(self.tabs.count()):
-                self.tabs.setTabVisible(i, True)
-            if self.tabs.count() > 0:
-                self.tabs.setCurrentIndex(0)
+                widget = self.tabs.widget(i)
+                self.tabs.setTabVisible(i, isinstance(widget, WebTabContent))
+            current = self.tabs.currentWidget()
+            if not isinstance(current, WebTabContent):
+                for i in range(self.tabs.count()):
+                    if isinstance(self.tabs.widget(i), WebTabContent):
+                        self.tabs.setCurrentIndex(i)
+                        break
+            self.on_tab_changed(self.tabs.currentIndex())
             return
 
         for i in range(self.tabs.count()):
@@ -2963,6 +3084,28 @@ class AlinvaultWindow(QMainWindow):
                 widget.set_dark_mode(self.dark_mode)
             if hasattr(widget, 'update'):
                 widget.update()
+
+    def setup_debug_profiler(self):
+        """Enable with ALINVAULT_PROFILE=1. Prints top Python/C call hotspots every 20s."""
+        if os.environ.get("ALINVAULT_PROFILE") != "1":
+            return
+        self._profiler = cProfile.Profile()
+        self._profiler.enable()
+        self._profile_timer = QTimer(self)
+        self._profile_timer.timeout.connect(self.dump_debug_profile)
+        self._profile_timer.start(20000)
+        print("[Alinvault profiler] enabled - snapshot every 20 seconds")
+
+    def dump_debug_profile(self):
+        profiler = getattr(self, "_profiler", None)
+        if profiler is None:
+            return
+        profiler.disable()
+        stream = io.StringIO()
+        pstats.Stats(profiler, stream=stream).strip_dirs().sort_stats("tottime").print_stats(20)
+        print("\n[Alinvault profiler snapshot]\n" + stream.getvalue())
+        profiler.clear()
+        profiler.enable()
 
     def setup_tray(self):
         if QSystemTrayIcon.isSystemTrayAvailable():
